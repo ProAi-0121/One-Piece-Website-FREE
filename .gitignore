@@ -1,0 +1,17 @@
+# episodes / personal data
+media/
+downloads/
+progress.json
+config.json
+
+# python
+__pycache__/
+*.pyc
+err.log
+
+# misc
+testout/
+*.png
+!static/icons/*.png
+!screenshots/*.png
+_ds/
