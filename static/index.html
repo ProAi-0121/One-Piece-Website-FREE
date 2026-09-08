@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>One Piece — Local Stream</title>
+<meta name="theme-color" content="#0d0f1a">
+<meta name="description" content="Private One Piece streaming server">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="icon" type="image/png" href="/icons/icon-192.png">
+<link rel="stylesheet" href="/style.css?v=11">
+<style id="substyle"></style>
+</head>
+<body>
+<header>
+  <div class="logo"><span class="jolly">☠</span> ONE <em>PIECE</em></div>
+  <input id="search" type="search" placeholder="Search episode #…">
+  <div class="filters">
+    <button data-f="all" class="on">All</button>
+    <button data-f="downloaded">Downloaded</button>
+    <button data-f="unwatched">Unwatched</button>
+    <button data-f="watched">Watched</button>
+  </div>
+  <div class="actions">
+    <span id="stats"></span>
+    <label class="tgl" title="Auto-delete old watched episodes"><input type="checkbox" id="autoDel"><span class="dot"></span>Auto-del</label>
+    <label class="tgl" title="Automatically play the next episode when one ends"><input type="checkbox" id="autoNextT"><span class="dot"></span>Auto-next</label>
+    <label class="tgl" title="Automatically skip the intro"><input type="checkbox" id="skipIntroT"><span class="dot"></span>Skip intro</label>
+    <button id="btn-batch" title="Download the next 5 un-downloaded episodes">⭳ Next 5</button>
+  </div>
+</header>
+
+<main>
+  <section id="hero" class="hidden">
+    <div class="hero-info">
+      <h2>Continue Watching</h2>
+      <p id="hero-sub"></p>
+      <button id="hero-play">▶ Resume</button>
+    </div>
+  </section>
+
+  <div id="grid" class="grid"></div>
+  <div id="empty" class="hidden">No episodes match.</div>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<div id="player-wrap" class="hidden">
+  <div class="player-box">
+    <div class="player-top">
+      <div class="pt-left">
+        <span class="pt-ep" id="player-ep">EP</span>
+        <span id="player-title">Episode</span>
+      </div>
+      <span class="player-ctl">
+        <button id="btn-next" title="Next episode (N)">Next ▶</button>
+        <button id="player-close" title="Close (Esc)">✕</button>
+      </span>
+    </div>
+    <video id="video" preload="metadata" playsinline>
+      <track id="subtrack" kind="subtitles" label="English" srclang="en" default>
+    </video>
+  </div>
+</div>
+          <div class="seek-fill" id="seekFill"></div>
+          <div class="seek-knob" id="seekKnob"></div>
+        </div>
+        <div class="ctlrow">
+          <button class="cbtn" id="cPlay" title="Play/Pause (Space)">▶</button>
+          <button class="cbtn" id="cNext" title="Next episode (N)">⏭</button>
+          <div class="volwrap">
+            <button class="cbtn" id="cMute" title="Mute (M)">🔊</button>
+            <input type="range" id="cVol" min="0" max="100" value="100" title="Volume">
+          </div>
+          <span class="ctime" id="cTime">0:00 / 0:00</span>
+          <span class="spacer"></span>
+          <button class="cbtn chip" id="cSub" title="Subtitle settings">CC</button>
+          <button class="cbtn chip" id="cSpeed" title="Playback speed">1x</button>
+          <button class="cbtn chip" id="cAutoNext" title="Toggle auto-next">Auto-next</button>
+          <button class="cbtn" id="cSettings" title="Settings">⚙</button>
+          <button class="cbtn" id="cFs" title="Fullscreen (F)">⛶</button>
+          <div class="ppopup hidden" id="subMenu">
+            <div class="set-h">Subtitles</div>
+            <label class="set-tgl"><input type="checkbox" id="subOn" checked><span>Subtitles on</span></label>
+            <div class="set-h">Timing offset (sec)</div>
+            <div class="offrow">
+              <button class="offbtn" id="offMinus">−</button>
+              <input type="number" id="subOff" step="0.5" min="-10" max="10" value="0">
+              <button class="offbtn" id="offPlus">+</button>
+            </div>
+            <div class="set-h">Size — <span id="subSizeVal">20px</span></div>
+            <input type="range" id="subSize" min="12" max="44" step="1" value="20">
+            <div class="set-h">Background — <span id="subBgVal">50%</span></div>
+            <input type="range" id="subBg" min="0" max="100" value="50">
+          </div>
+          <div class="ppopup hidden" id="speedMenu">
+            <div class="set-h">Playback speed</div>
+            <div class="speeds" id="speeds">
+              <button data-s="0.5">0.5x</button>
+              <button data-s="0.75">0.75x</button>
+              <button data-s="1" class="on">1x</button>
+              <button data-s="1.25">1.25x</button>
+              <button data-s="1.5">1.5x</button>
+              <button data-s="2">2x</button>
+            </div>
+          </div>
+          <div class="ppopup hidden" id="settingsMenu">
+            <div class="set-h">Playback</div>
+            <label class="set-tgl"><input type="checkbox" id="setAutoNext"><span>Auto-next</span></label>
+            <label class="set-tgl"><input type="checkbox" id="setSkipIntro"><span>Auto-skip intro</span></label>
+            <label class="set-tgl"><input type="checkbox" id="setSkipOutro"><span>Auto-skip outro</span></label>
+            <div class="set-h">Fullscreen zoom — <span id="fsZoomVal">100%</span></div>
+            <input type="range" id="fsZoom" min="100" max="200" step="5" value="100">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js?v=10"></script>
+</body>
+</html>
