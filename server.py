@@ -82,8 +82,57 @@ def _is_watched(rec):
     return t > WATCH_AFTER_SEC or (d > 0 and t / d >= 0.95)
 
 
+def _sidecar(ep):
+    return os.path.join(MEDIA, f"ep{ep:04d}.json")
+
+
+def _read_meta(ep):
+    if os.path.exists(_sidecar(ep)):
+        try:
+            return json.load(open(_sidecar(ep), encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _build_meta(ep):
+    """Fetch title/intro/subs for an already-downloaded episode (backfill)."""
+    embed = f"{dl.BASE}/embed/hd-2/ani/{ANIME_ID}/{ep}/dub"
+    try:
+        meta = dl.open_embed(embed)
+    except Exception:
+        return
+    m = {
+        "title": dl.clean_title(meta.get("title", "")) or f"Episode {ep}",
+        "intro": meta.get("intro") or {"start": 0, "end": 0},
+    }
+    if meta.get("vtt"):
+        if dl.download_vtt(meta["vtt"], embed, os.path.join(MEDIA, f"ep{ep:04d}.en.vtt")):
+            m["sub"] = True
+    with open(_sidecar(ep), "w", encoding="utf-8") as f:
+        json.dump(m, f)
+
+
+def _make_thumb(ep):
+    dl.make_thumb(ep_path(ep), os.path.join(MEDIA, f"ep{ep:04d}.jpg"), at=30)
+
+
+def _backfill():
+    """Fill missing thumbnails/metadata for episodes downloaded earlier."""
+    time.sleep(3)
+    for f in sorted(os.listdir(MEDIA)):
+        if not f.endswith(".mp4"):
+            continue
+        ep = int(f[2:6])
+        if not os.path.exists(_sidecar(ep)):
+            _build_meta(ep)
+        time.sleep(1)
+
+
+
 def _cleanup_watched():
-    """Keep only the KEEP_WATCHED most recent watched episodes on disk."""
+    """Keep only the KEEP_WATCHED most recent watched episodes on disk;
+    delete older watched files (progress records are kept for re-download."""
     if not _auto_delete_enabled():
         return []
     with _lock:
@@ -93,15 +142,18 @@ def _cleanup_watched():
         watched.sort(key=lambda kv: kv[1].get("updated", 0), reverse=True)
         removed = []
         for k, _ in watched[KEEP_WATCHED:]:
-            ep = int(k_)
+            ep = int(k)
             try:
                 os.remove(ep_path(ep))
                 removed.append(ep)
             except OSError:
                 pass
+            for ext in (".json", ".en.vtt", ".jpg"):
+                try:
+                    os.remove(os.path.join(MEDIA, f"ep{ep:04d}{ext}"))
+                except OSError:
+                    pass
         return removed
-
-
 def _queue_worker():
     """One download at a time — gentle on the source and easy to track."""
     while True:
@@ -110,6 +162,34 @@ def _queue_worker():
         try:
             embed = f"{dl.BASE}/embed/hd-2/ani/{ANIME_ID}/{ep}/dub"
             job["state"] = "resolving"
+            meta = dl.open_embed(embed)
+            master = meta.get("master")
+            if not master:
+                job["state"], job["error"] = "error", "episode not found on source server"
+                continue
+            job["state"] = "downloading"
+            job["done"], job["total"] = 0, 0
+
+            def prog(done, total):
+                job["done"], job["total"] = done, total
+
+            ok = dl.download_episode(master, embed, ep_path(ep), on_progress=prog)
+            job["state"] = "done" if ok else "error"
+            if not ok:
+                job["error"] = "ffmpeg remux failed"
+                continue
+            # extras: title/intro/subs/thumbnail
+            try:
+                m = {"title": dl.clean_title(meta.get("title", "")) or f"Episode {ep}",
+                     "intro": meta.get("intro") or {"start": 0, "end": 0}}
+                if meta.get("vtt"):
+                    if dl.download_vtt(meta["vtt"], embed,
+                                       os.path.join(MEDIA, f"ep{ep:04d}.en.vtt")):
+                        m["sub"] = True
+                with open(_sidecar(ep), "w", encoding="utf-8") as f:
+                    json.dump(m, f)
+            except Exception:
+                pass
         except Exception as e:
             job["state"], job["error"] = "error", str(e)[:200]
 
@@ -169,12 +249,17 @@ def episodes():
         d = p.get("duration", 0)
         pct = round(100 * t / d, 1) if d else 0
         watched = _is_watched(p)
+        meta = _read_meta(ep) if ep_exists(ep) else {}
         job = _jobs.get(ep)
         out.append({
             "ep": ep,
             "exists": ep_exists(ep),
             "size": os.path.getsize(ep_path(ep)) if ep_exists(ep) else 0,
             "time": t, "duration": d, "pct": pct, "watched": watched,
+            "title": meta.get("title") or f"Episode {ep}",
+            "intro": meta.get("intro") or {"start": 0, "end": 0},
+            "sub": bool(meta.get("sub")) and os.path.exists(
+                os.path.join(MEDIA, f"ep{ep:04d}.en.vtt")),
             "job": {k: job[k] for k in ("state", "done", "total", "error")} if job else None,
         })
     return jsonify(out)
@@ -230,6 +315,26 @@ def mark_watched(ep):
         _save_progress(p)
     removed = _cleanup_watched()
     return jsonify({"ok": True, "watched": cur["watched"], "removed": removed})
+
+
+@app.get("/api/settings")
+def get_settings():
+    c = _cfg()
+    return jsonify({
+        "auto_delete": bool(c.get("auto_delete", True)),
+        "last_episode": int(c.get("last_episode", DEFAULT_LAST_EP)),
+    })
+
+
+@app.post("/api/settings")
+def set_settings():
+    d = request.get_json(force=True, silent=True) or {}
+    with _lock:
+        c = _cfg()
+        if "auto_delete" in d:
+            c["auto_delete"] = bool(d.get("auto_delete") if "auto_delete" in d else c.get("auto_delete", True))
+        _save_cfg(c)
+    return jsonify({"ok": True, "auto_delete": bool(c["auto_delete"])})
 
 
 @app.post("/api/reset/<int:ep>")
@@ -306,25 +411,35 @@ def stats():
 @app.get("/api/continue")
 
 def continue_watching():
+    """Resume = the highest episode you have started, even if finished."""
     prog = _load_progress()
-    best, best_t = None, -1
-    for k, v in prog.items():
-        d = v.get("duration", 0)
-        t = v.get("time", 0)
-        if d and 0 < t and t / d < 0.95 and t > best_t and ep_exists(int(k)):
-            best, best_t = int(k), t
-    if best:
-        return jsonify({"ep": best, "time": best_t, "exists": True})
-    recent, recent_ts = None, -1
-    for k, v in prog.items():
-        ts = v.get("updated", 0)
-        if ts > recent_ts:
-            recent_ts, recent = ts, int(k)
-    nxt = (recent + 1) if recent else None
-    if nxt:
-        return jsonify({"ep": nxt, "time": 0, "exists": ep_exists(nxt)})
-    return jsonify({"ep": None, "time": -1, "exists": False})
+    best = None
+    for k in prog:
+        try:
+            ep = int(k)
+        except ValueError:
+            continue
+        if best is None or ep > best:
+            best = ep
+    if best is None:
+        return jsonify({'ep': None, 'time': -1, 'exists': False, 'finished': False})
+    rec = prog.get(str(best), {})
+    t = rec.get('time', 0)
+    d = rec.get('duration', 0)
+    finished = bool(d and t / d >= 0.95)
+    return jsonify({'ep': best, 'time': 0 if finished else t,
+                    'exists': ep_exists(best), 'finished': finished})
 
+
+@app.post('/api/started/<int:ep>')
+def started(ep):
+    """Mark an episode as started (creates a zero-progress record if none)."""
+    with _lock:
+        p = _load_progress()
+        if str(ep) not in p:
+            p[str(ep)] = {'time': 0, 'duration': 0, 'updated': time.time()}
+            _save_progress(p)
+    return jsonify({'ok': True})
 
 if __name__ == "__main__":
     threading.Thread(target=_backfill, daemon=True).start()
