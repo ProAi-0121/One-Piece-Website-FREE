@@ -50,8 +50,8 @@
 <div id="toast" class="toast"></div>
 
 <div id="player-wrap" class="hidden">
-  <div class="player-box">
-    <div class="player-top">
+  <div class="player-box" id="playerBox">
+    <div class="player-top" id="playerTop">
       <div class="pt-left">
         <span class="pt-ep" id="player-ep">EP</span>
         <span id="player-title">Episode</span>
@@ -61,11 +61,20 @@
         <button id="player-close" title="Close (Esc)">✕</button>
       </span>
     </div>
-    <video id="video" preload="metadata" playsinline>
-      <track id="subtrack" kind="subtitles" label="English" srclang="en" default>
-    </video>
-  </div>
-</div>
+    <div class="stage" id="stage">
+      <video id="video" preload="metadata" playsinline>
+        <track id="subtrack" kind="subtitles" label="English" srclang="en" default>
+      </video>
+      <div id="pauseOverlay" class="hidden">
+        <div class="po-play">▶</div>
+        <div class="po-ep" id="po-ep"></div>
+        <div class="po-title" id="po-title"></div>
+      </div>
+      <button id="btn-skipintro" class="hidden">Skip Intro ➜</button>
+      <button id="btn-skipoutro" class="hidden">Skip Outro ➜</button>
+      <div class="ctlbar" id="ctlbar">
+        <div class="seek" id="seek">
+          <div class="seek-buf" id="seekBuf"></div>
           <div class="seek-fill" id="seekFill"></div>
           <div class="seek-knob" id="seekKnob"></div>
         </div>
