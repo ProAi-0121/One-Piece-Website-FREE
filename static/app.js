@@ -1,9 +1,15 @@
-/* app.js — One Piece local stream UI */
+/* app.js — One Piece local stream UI + custom player */
 let EPS = [];
 let FILTER = "all";
 let QUERY = "";
 let currentEp = null;
 let saveTimer = null;
+let curIntro = null;
+let curOutro = null;
+let outroHandled = false;
+let autoSkipPref = localStorage.getItem("autoSkipIntro") === "1";
+let autoNextPref = localStorage.getItem("autoNext") !== "0";
+let autoSkipOutroPref = localStorage.getItem("autoSkipOutro") !== "0";
 let nextQueued = false;
 
 const $ = (s) => document.querySelector(s);
@@ -31,17 +37,9 @@ async function load() {
   continueHero();
 }
 
-async function continueHero() {
-  const c = await (await fetch("/api/continue")).json();
-  const hero = $("#hero");
-  if (!c.ep || !c.exists) { hero.classList.add("hidden"); return; }
-  hero.classList.remove("hidden");
-  $("#hero-sub").textContent = `Episode ${c.ep} — ${fmt(c.time)} watched`;
-  $("#hero-play").onclick = () => openPlayer(c.ep, c.time);
-}
-
 function match(ep) {
-  if (QUERY && !String(ep.ep).includes(QUERY)) return false;
+  if (QUERY && !String(ep.ep).includes(QUERY) &&
+      !(ep.title || "").toLowerCase().includes(QUERY.toLowerCase())) return false;
   if (FILTER === "downloaded") return ep.exists;
   if (FILTER === "watched") return ep.watched;
   if (FILTER === "unwatched") return ep.exists && !ep.watched;
@@ -81,6 +79,7 @@ function render() {
 
     card.innerHTML = `
       <div class="num">Episode <b>${ep.ep}</b>${mark}</div>
+      <div class="ep-title">${ep.title}</div>
       <div class="badges">${ep.exists ? `<span class="badge ok">READY</span>` : ""}<span class="badge hd">1080p</span><span class="badge dub">DUB</span>${ep.watched ? `<span class="badge watched-b">✓ WATCHED</span>` : ""}</div>
       ${progline}
       <div class="dl-info">${ep.exists ? (pct ? `Resume at ${fmt(ep.time)} · ${(ep.size/1e6).toFixed(0)} MB` : `${(ep.size/1e6).toFixed(0)} MB`) : (ep.job && ep.job.error ? ep.job.error : "Not downloaded yet")}</div>
@@ -112,69 +111,370 @@ grid.addEventListener("click", async (e) => {
     poll();
   }
 });
+
+async function continueHero() {
+  const c = await (await fetch("/api/continue")).json();
+  const hero = $("#hero");
+  if (!c.ep) { hero.classList.add("hidden"); return; }
+  hero.classList.remove("hidden");
+  let where;
+  if (c.finished) where = "Finished — replay";
+  else if (c.time > 0) where = "Resume at " + fmt(c.time);
+  else where = "Start from the beginning";
+  if (!c.exists) where += " · needs download";
+  $("#hero-sub").textContent = `Episode ${c.ep} — ${where}`;
+  $("#hero-play").onclick = () => playOrFetch(c.ep, c.time);
+}
+
+function playOrFetch(ep, time) {
+  const info = EPS.find(x => x.ep === ep);
+  if (info && info.exists) { openPlayer(ep, time); return; }
+  fetch(`/api/download/${ep}`, { method: "POST" })
+    .then(() => { poll(); toast(`Downloading episode ${ep} — will start when ready`); })
+    .catch(() => {});
+  waitAndPlay(ep, time);
+}
+
+function waitAndPlay(ep, time) {
+  const iv = setInterval(async () => {
+    try {
+      const d = await (await fetch("/api/episodes")).json();
+      const e = d.find(x => x.ep === ep);
+      if (e && e.exists) { clearInterval(iv); EPS = d; openPlayer(ep, time); }
+      else if (e && e.job && e.job.state === "error") {
+        clearInterval(iv);
+        toast(`Download failed for episode ${ep}`);
+      }
+    } catch (err) {}
+  }, 2000);
+}
+
+/* ================= PLAYER ================= */
+const V = $("#video");
+const stage = $("#stage");
+const playerBox = $("#playerBox");
+
+function setPlayIcon() {
+  $("#cPlay").textContent = V.paused ? "▶" : "⏸";
+}
+
 function openPlayer(ep, startAt) {
   currentEp = ep;
+  const info = EPS.find(x => x.ep === ep) || {};
   $("#player-ep").textContent = "EP " + ep;
-  $("#player-title").textContent = "Episode " + ep;
-  const v = $("#video");
-  v.controls = true;
-  v.src = `/video/${ep}`;
+  $("#player-title").textContent = info.title || "";
+  $("#po-ep").textContent = "EP " + ep;
+  $("#po-title").textContent = info.title || "";
+  fetch(`/api/started/${ep}`, { method: "POST" }).catch(() => {});
+  loadSubtitleText(ep, info.sub);
+  V.src = `/video/${ep}`;
   $("#player-wrap").classList.remove("hidden");
-  v.onloadedmetadata = () => {
-    if (startAt > 0 && startAt < v.duration - 5) v.currentTime = startAt;
-    v.play().catch(() => {});
+  curIntro = (info.intro && info.intro.end > info.intro.start) ? info.intro : null;
+  curOutro = (info.outro && info.outro.end > info.outro.start) ? info.outro : null;
+  outroHandled = false;
+  nextQueued = false;
+  V.onloadedmetadata = () => {
+    if (startAt > 0 && startAt < V.duration - 5) V.currentTime = startAt;
+    else if (autoSkipPref && curIntro && V.currentTime < curIntro.start) V.currentTime = curIntro.end;
+    V.play().catch(() => {});
   };
-  v.ontimeupdate = () => {
-    // after ~2 minutes of watching, prefetch the next episode
-    if (!nextQueued && v.currentTime > 120) {
-      nextQueued = true;
-      const nx = EPS.find(x => x.ep === ep + 1);
-      if (nx && !nx.exists) {
-        fetch(`/api/download/${ep + 1}`, { method: "POST" }).then(poll).catch(() => {});
-        toast(`Episode ${ep + 1} downloading for next`);
-      }
-    }
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      fetch("/api/progress", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ep, time: v.currentTime, duration: v.duration || 0 }),
-      });
-    }, 800);
+  V.ontimeupdate = onTimeUpdate;
+  V.onplay = () => { setPlayIcon(); $("#pauseOverlay").classList.add("hidden"); };
+  V.onpause = () => {
+    setPlayIcon();
+    if (!V.ended) $("#pauseOverlay").classList.remove("hidden");
   };
+  syncPrefsUI();
+  V.play().catch(() => {});
 }
 
 function closePlayer() {
-  const v = $("#video");
-  v.pause();
-  if (currentEp != null && v.duration) {
+  V.pause();
+  if (currentEp != null && V.duration) {
     fetch("/api/progress", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ep: currentEp, time: v.currentTime, duration: v.duration }),
+      body: JSON.stringify({ ep: currentEp, time: V.currentTime, duration: V.duration }),
     });
   }
-  v.removeAttribute("src"); v.load();
+  V.removeAttribute("src"); V.load();
   $("#player-wrap").classList.add("hidden");
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   currentEp = null;
   load();
 }
+
+function nextEp() {
+  if (currentEp == null) return;
+  const nxt = EPS.find(x => x.ep === currentEp + 1);
+  if (nxt && nxt.exists) openPlayer(nxt.ep, 0);
+  else if (nxt) playOrFetch(nxt.ep, 0);
+}
+
+function onTimeUpdate() {
+  const t = V.currentTime, d = V.duration || 0;
+  if (d) {
+    $("#seekFill").style.width = (100 * t / d) + "%";
+    $("#seekKnob").style.left = (100 * t / d) + "%";
+    $("#cTime").textContent = fmt(t) + " / " + fmt(d);
+  }
+  try {
+    if (V.buffered.length && d) {
+      const end = V.buffered.end(V.buffered.length - 1);
+      $("#seekBuf").style.width = (100 * end / d) + "%";
+    }
+  } catch (e) {}
+  if (!nextQueued && t > 120) {
+    nextQueued = true;
+    const nx = EPS.find(x => x.ep === currentEp + 1);
+    if (nx && !nx.exists) {
+      fetch(`/api/download/${currentEp + 1}`, { method: "POST" }).then(poll).catch(() => {});
+      toast(`Episode ${currentEp + 1} downloading for next`);
+    }
+  }
+  const inIntro = curIntro && t >= curIntro.start && t < curIntro.end - 1;
+  $("#btn-skipintro").classList.toggle("hidden", !inIntro);
+  if (autoSkipPref && inIntro) V.currentTime = curIntro.end;
+  const inOutro = curOutro && t >= curOutro.start && t < curOutro.end - 1;
+  $("#btn-skipoutro").classList.toggle("hidden", !(inOutro && !outroHandled));
+  if (curOutro && !outroHandled && t >= curOutro.start) {
+    outroHandled = true;
+    if (autoSkipOutroPref) {
+      if (autoNextPref) { nextEp(); return; }
+      V.currentTime = Math.min(curOutro.end, d - 1);
+    }
+  }
+  if (autoNextPref && d && t >= d - 0.5 && !outroHandled) nextEp();
+  $("#pauseOverlay").classList.toggle("hidden", !V.paused);
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    fetch("/api/progress", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ep: currentEp, time: t, duration: d }),
+    });
+  }, 800);
+}
+
+/* ---------- controls wiring ---------- */
+$("#cPlay").onclick = () => V.paused ? V.play() : V.pause();
+$("#cNext").onclick = nextEp;
+$("#btn-next").onclick = nextEp;
+$("#cMute").onclick = () => { V.muted = !V.muted; $("#cMute").textContent = V.muted ? "🔇" : "🔊"; };
+$("#cVol").oninput = (e) => { V.volume = e.target.value / 100; V.muted = e.target.value == 0; };
+
+V.addEventListener("click", () => V.paused ? V.play() : V.pause());
+V.addEventListener("dblclick", toggleFs);
+$("#pauseOverlay").addEventListener("click", () => V.play());
+
+/* seek: click + drag */
+const seek = $("#seek");
+let dragging = false;
+function seekTo(clientX) {
+  const r = seek.getBoundingClientRect();
+  const f = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+  if (V.duration) V.currentTime = f * V.duration;
+}
+seek.addEventListener("pointerdown", (e) => {
+  dragging = true;
+  seek.setPointerCapture(e.pointerId);
+  seekTo(e.clientX);
+});
+seek.addEventListener("pointermove", (e) => { if (dragging) seekTo(e.clientX); });
+seek.addEventListener("pointerup", () => { dragging = false; });
+
+/* fullscreen */
+function toggleFs() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else playerBox.requestFullscreen().catch(() => {});
+}
+$("#cFs").onclick = toggleFs;
+document.addEventListener("fullscreenchange", () => {
+  $("#cFs").textContent = document.fullscreenElement ? "⤡" : "⛶";
+});
+
+/* auto-next chip */
+$("#cAutoNext").onclick = () => setPref("autoNext", !autoNextPref);
+
+/* popup menus */
+function togglePopup(id) {
+  const el = $("#" + id);
+  const wasOpen = !el.classList.contains("hidden");
+  ["subMenu", "speedMenu", "settingsMenu"].forEach(x => $("#" + x).classList.add("hidden"));
+  if (!wasOpen) el.classList.remove("hidden");
+}
+$("#cSettings").onclick = (e) => { e.stopPropagation(); togglePopup("settingsMenu"); };
+$("#cSub").onclick = (e) => { e.stopPropagation(); togglePopup("subMenu"); };
+$("#cSpeed").onclick = (e) => { e.stopPropagation(); togglePopup("speedMenu"); };
+document.addEventListener("click", (e) => {
+  if (e.target.closest(".ppopup") || e.target.closest("#cSettings") ||
+      e.target.closest("#cSub") || e.target.closest("#cSpeed")) return;
+  ["subMenu", "speedMenu", "settingsMenu"].forEach(x => $("#" + x).classList.add("hidden"));
+});
+$("#speeds").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-s]");
+  if (!b) return;
+  V.playbackRate = parseFloat(b.dataset.s);
+  localStorage.setItem("speed", b.dataset.s);
+  [...$("#speeds").children].forEach(x => x.classList.toggle("on", x === b));
+  $("#cSpeed").textContent = b.dataset.s + "x";
+});
+["setAutoNext", "setSkipIntro", "setSkipOutro"].forEach((id, i) => {
+  const keys = ["autoNext", "autoSkipIntro", "autoSkipOutro"];
+  $("#" + id).onchange = (e) => setPref(keys[i], e.target.checked);
+});
+
+/* ---------- subtitle engine ---------- */
+let subOffset = parseFloat(localStorage.getItem("subOffset") ?? "7.5");
+if (isNaN(subOffset)) subOffset = 7.5;
+let subSize = parseInt(localStorage.getItem("subSize") || "20", 10);
+let subBg = parseInt(localStorage.getItem("subBg") || "50", 10);
+let subsOn = localStorage.getItem("subsOn") !== "0";
+let fsZoom = parseInt(localStorage.getItem("fsZoom") || "100", 10);
+let currentVttText = null;
+let lastSubUrl = null;
+
+function shiftVtt(text, off) {
+  if (!off) return text;
+  return text.replace(/(\d{2}):(\d{2}):(\d{2})\.(\d{3})/g, (m, h, mi, sec, ms) => {
+    let total = (+h) * 3600 + (+mi) * 60 + (+sec) + (+ms) / 1000 + off;
+    if (total < 0) total = 0;
+    const H = String(Math.floor(total / 3600)).padStart(2, "0");
+    const M = String(Math.floor(total / 60) % 60).padStart(2, "0");
+    const S = String(Math.floor(total % 60)).padStart(2, "0");
+    const MS = String(Math.round((total % 1) * 1000)).padStart(3, "0");
+    return H + ":" + M + ":" + S + "." + MS;
+  });
+}
+
+function applySubtitleTrack() {
+  const st = $("#subtrack");
+  if (!currentVttText) { st.removeAttribute("src"); return; }
+  if (lastSubUrl) URL.revokeObjectURL(lastSubUrl);
+  const blob = new Blob([shiftVtt(currentVttText, subOffset)], { type: "text/vtt" });
+  lastSubUrl = URL.createObjectURL(blob);
+  st.src = lastSubUrl;
+  st.track.mode = subsOn ? "showing" : "hidden";
+}
+
+function applySubStyle() {
+  document.getElementById("substyle").textContent =
+    "video::cue { font-size: " + subSize + "px; background: rgba(0,0,0," + (subBg / 100) + ") !important; }";
+  $("#subSizeVal").textContent = subSize + "px";
+  $("#subBgVal").textContent = subBg + "%";
+}
+
+function loadSubtitleText(ep, has) {
+  currentVttText = null;
+  if (!has) { applySubtitleTrack(); return; }
+  fetch(`/sub/${ep}`).then(r => r.text()).then(txt => {
+    currentVttText = txt;
+    applySubtitleTrack();
+  }).catch(() => applySubtitleTrack());
+}
+
+$("#subOn").onchange = (e) => {
+  subsOn = e.target.checked;
+  localStorage.setItem("subsOn", subsOn ? "1" : "0");
+  $("#cSub").classList.toggle("on", subsOn);
+  applySubtitleTrack();
+};
+$("#subOff").oninput = (e) => {
+  let v = parseFloat(e.target.value);
+  if (isNaN(v)) v = 0;
+  subOffset = v;
+  localStorage.setItem("subOffset", String(v));
+  applySubtitleTrack();
+};
+function stepOffset(d) {
+  const i = $("#subOff");
+  const v = Math.round(((parseFloat(i.value) || 0) + d) * 100) / 100;
+  i.value = v;
+  subOffset = v;
+  localStorage.setItem("subOffset", String(v));
+  applySubtitleTrack();
+}
+$("#offMinus").onclick = () => stepOffset(-0.5);
+$("#offPlus").onclick = () => stepOffset(0.5);
+$("#subSize").oninput = (e) => {
+  subSize = parseInt(e.target.value, 10);
+  localStorage.setItem("subSize", String(subSize));
+  applySubStyle();
+};
+$("#subBg").oninput = (e) => {
+  subBg = parseInt(e.target.value, 10);
+  localStorage.setItem("subBg", String(subBg));
+  applySubStyle();
+};
+$("#fsZoom").oninput = (e) => {
+  fsZoom = parseInt(e.target.value, 10);
+  localStorage.setItem("fsZoom", String(fsZoom));
+  applyFsZoom();
+};
+function applyFsZoom() {
+  playerBox.style.setProperty("--fszoom", fsZoom / 100);
+  $("#fsZoomVal").textContent = fsZoom + "%";
+}
+
+function setPref(name, val) {
+  if (name === "autoNext") autoNextPref = val;
+  if (name === "autoSkipIntro") autoSkipPref = val;
+  if (name === "autoSkipOutro") autoSkipOutroPref = val;
+  localStorage.setItem(name, val ? "1" : "0");
+  syncPrefsUI();
+  const labels = { autoNext: "Auto-next", autoSkipIntro: "Auto-skip intro", autoSkipOutro: "Auto-skip outro" };
+  toast(labels[name] + (val ? " ON" : " OFF"));
+}
+
+function syncPrefsUI() {
+  const map = { setAutoNext: autoNextPref, setSkipIntro: autoSkipPref, setSkipOutro: autoSkipOutroPref };
+  for (const id in map) {
+    const el = document.getElementById(id);
+    if (el) el.checked = map[id];
+  }
+  const chip = $("#cAutoNext");
+  if (chip) chip.classList.toggle("on", autoNextPref);
+  const h = document.getElementById("autoNextT");
+  if (h) { h.checked = autoNextPref; h.closest(".tgl").classList.toggle("on", autoNextPref); }
+  const si = document.getElementById("skipIntroT");
+  if (si) { si.checked = autoSkipPref; si.closest(".tgl").classList.toggle("on", autoSkipPref); }
+}
+
+/* skip buttons */
+$("#btn-skipintro").onclick = () => { if (curIntro) V.currentTime = curIntro.end; };
+$("#btn-skipoutro").onclick = () => {
+  if (curOutro) V.currentTime = Math.min(curOutro.end, (V.duration || 0) - 1);
+};
+
+/* UI auto-hide in fullscreen + hover title */
+let uiTimer = null;
+stage.addEventListener("mousemove", () => {
+  playerBox.classList.remove("hideui");
+  clearTimeout(uiTimer);
+  if (document.fullscreenElement) {
+    uiTimer = setTimeout(() => playerBox.classList.add("hideui"), 2500);
+  }
+});
+playerBox.addEventListener("mouseleave", () => {
+  if (document.fullscreenElement) playerBox.classList.add("hideui");
+});
+
+/* close */
 $("#player-close").onclick = closePlayer;
 
 /* keyboard shortcuts (only while the player is open) */
 document.addEventListener("keydown", (e) => {
   if ($("#player-wrap").classList.contains("hidden")) return;
-  const v = $("#video");
   if (e.target.tagName === "INPUT") return;
   if (e.key === "Escape") { closePlayer(); return; }
-  if (e.code === "Space") { e.preventDefault(); v.paused ? v.play() : v.pause(); }
-  else if (e.key === "ArrowRight") v.currentTime = Math.min(v.duration || 0, v.currentTime + 10);
-  else if (e.key === "ArrowLeft") v.currentTime = Math.max(0, v.currentTime - 10);
-  else if (e.key.toLowerCase() === "f") {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else v.requestFullscreen();
-  }
+  if (e.code === "Space") { e.preventDefault(); V.paused ? V.play() : V.pause(); }
+  else if (e.key === "ArrowRight") V.currentTime = Math.min(V.duration || 0, V.currentTime + 10);
+  else if (e.key === "ArrowLeft") V.currentTime = Math.max(0, V.currentTime - 10);
+  else if (e.key === "ArrowUp") { V.volume = Math.min(1, V.volume + 0.1); $("#cVol").value = V.volume * 100; }
+  else if (e.key === "ArrowDown") { V.volume = Math.max(0, V.volume - 0.1); $("#cVol").value = V.volume * 100; }
+  else if (e.key.toLowerCase() === "m") { V.muted = !V.muted; $("#cMute").textContent = V.muted ? "🔇" : "🔊"; }
+  else if (e.key.toLowerCase() === "f") toggleFs();
+  else if (e.key.toLowerCase() === "n") nextEp();
 });
 $("#player-wrap").addEventListener("click", (e) => { if (e.target.id === "player-wrap") closePlayer(); });
 
@@ -207,6 +507,49 @@ async function refreshStats() {
 }
 
 async function boot() {
+  /* header toggle pills */
+  function bindTgl(id, initial, onChange) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.checked = initial;
+    el.closest(".tgl").classList.toggle("on", initial);
+    el.onchange = () => {
+      el.closest(".tgl").classList.toggle("on", el.checked);
+      onChange(el.checked);
+    };
+  }
+  let autoDel = true;
+  try {
+    const s = await (await fetch("/api/settings")).json();
+    autoDel = !!s.auto_delete;
+  } catch (e) {}
+  bindTgl("autoDel", autoDel, async (on) => {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto_delete: on }),
+    });
+    toast(on ? "Auto-delete ON" : "Auto-delete OFF");
+  });
+  bindTgl("autoNextT", autoNextPref, (on) => setPref("autoNext", on));
+  bindTgl("skipIntroT", autoSkipPref, (on) => setPref("autoSkipIntro", on));
+  /* saved playback speed */
+  const sp = parseFloat(localStorage.getItem("speed") || "1");
+  if (sp !== 1) {
+    V.playbackRate = sp;
+    [...$("#speeds").children].forEach(x => x.classList.toggle("on", x.dataset.s == sp));
+  }
+  $("#cSpeed").textContent = (V.playbackRate || 1) + "x";
+  /* subtitle prefs */
+  $("#subOn").checked = subsOn;
+  $("#subOff").value = subOffset;
+  $("#subSize").value = subSize;
+  $("#subBg").value = subBg;
+  $("#cSub").classList.toggle("on", subsOn);
+  applySubStyle();
+  applyFsZoom();
+  $("#fsZoom").value = fsZoom;
+  syncPrefsUI();
   await load();
   refreshStats();
   setInterval(refreshStats, 10000);
