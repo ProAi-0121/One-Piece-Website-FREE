@@ -4,6 +4,7 @@ let FILTER = "all";
 let QUERY = "";
 let currentEp = null;
 let saveTimer = null;
+let nextQueued = false;
 
 const $ = (s) => document.querySelector(s);
 const grid = $("#grid");
@@ -27,6 +28,16 @@ function toast(msg, ms) {
 async function load() {
   EPS = await (await fetch("/api/episodes")).json();
   render();
+  continueHero();
+}
+
+async function continueHero() {
+  const c = await (await fetch("/api/continue")).json();
+  const hero = $("#hero");
+  if (!c.ep || !c.exists) { hero.classList.add("hidden"); return; }
+  hero.classList.remove("hidden");
+  $("#hero-sub").textContent = `Episode ${c.ep} — ${fmt(c.time)} watched`;
+  $("#hero-play").onclick = () => openPlayer(c.ep, c.time);
 }
 
 function match(ep) {
@@ -107,6 +118,15 @@ function openPlayer(ep, startAt) {
     v.play().catch(() => {});
   };
   v.ontimeupdate = () => {
+    // after ~2 minutes of watching, prefetch the next episode
+    if (!nextQueued && v.currentTime > 120) {
+      nextQueued = true;
+      const nx = EPS.find(x => x.ep === ep + 1);
+      if (nx && !nx.exists) {
+        fetch(`/api/download/${ep + 1}`, { method: "POST" }).then(poll).catch(() => {});
+        toast(`Episode ${ep + 1} downloading for next`);
+      }
+    }
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       fetch("/api/progress", {
