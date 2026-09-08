@@ -59,7 +59,7 @@ function render() {
     card.className = "card" + (ep.watched ? " watched" : "");
     card.dataset.ep = ep.ep;
 
-    const pct = ep.pct || 0;
+    const mark = `<button class="btn-mark${ep.watched ? " on" : ""}" data-mark="${ep.ep}" title="Mark watched / unwatched">${ep.watched ? "✓" : "○"}</button>`;
     const progline = ep.exists && pct
       ? `<div class="bar"><div style="width:${pct}%"></div></div>` : "";
 
@@ -79,7 +79,7 @@ function render() {
     }
 
     card.innerHTML = `
-      <div class="num">Episode <b>${ep.ep}</b></div>
+      <div class="num">Episode <b>${ep.ep}</b>${mark}</div>
       <div class="badges">${ep.exists ? `<span class="badge ok">READY</span>` : ""}<span class="badge hd">1080p</span><span class="badge dub">DUB</span>${ep.watched ? `<span class="badge watched-b">✓ WATCHED</span>` : ""}</div>
       ${progline}
       <div class="dl-info">${ep.exists ? (pct ? `Resume at ${fmt(ep.time)} · ${(ep.size/1e6).toFixed(0)} MB` : `${(ep.size/1e6).toFixed(0)} MB`) : (ep.job && ep.job.error ? ep.job.error : "Not downloaded yet")}</div>
@@ -97,6 +97,12 @@ grid.addEventListener("click", async (e) => {
   if (p && !p.disabled) {
     const ep = EPS.find(x => x.ep == p.dataset.play);
     openPlayer(ep.ep, ep.time || 0);
+    return;
+  }
+  const m = e.target.closest("[data-mark]");
+  if (m) {
+    await fetch(`/api/watched/${m.dataset.mark}`, { method: "POST" });
+    load();
     return;
   }
   const d = e.target.closest("[data-dl]");
