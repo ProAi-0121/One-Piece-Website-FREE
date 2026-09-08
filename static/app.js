@@ -59,6 +59,7 @@ function render() {
     card.className = "card" + (ep.watched ? " watched" : "");
     card.dataset.ep = ep.ep;
 
+    const pct = ep.pct || 0;
     const mark = `<button class="btn-mark${ep.watched ? " on" : ""}" data-mark="${ep.ep}" title="Mark watched / unwatched">${ep.watched ? "✓" : "○"}</button>`;
     const progline = ep.exists && pct
       ? `<div class="bar"><div style="width:${pct}%"></div></div>` : "";
