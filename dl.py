@@ -1,8 +1,24 @@
 """
-dl.py â€” downloads episodes from the embed cdn and stitches the
-ts segments into a single mp4 with ffmpeg.
+dl.py — Direct downloader for hianime.lol episodes via the 4animo embed CDN.
+
+Flow:
+  1. Playwright opens the embed page (needed only to obtain the getSources
+     token) -> master HLS playlist URL.
+  2. Plain requests fetches master -> variant -> segments.
+  3. IMPORTANT: every "segment" is served as a PNG image with the real
+     MPEG-TS data APPENDED AFTER THE IEND CHUNK. We strip the PNG prefix.
+  4. Segments are concatenated and remuxed to .mp4 with ffmpeg (-c copy).
+
+The 4th DUB server maps to:  https://cdn.4animo.xyz/embed/hd-2/ani/21/<ep>/dub
+
+Usage:
+    python dl.py --ep 556
+    python dl.py --ep-range 556 600
+    python dl.py --ep 556 --server hd-1 --sub
+    python dl.py --ep 556 --test
+    python dl.py --ep 556 --out "D:\\Anime\\OP"
 """
-import argparse, os, shutil, subprocess, sys, tempfile
+import argparse, os, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -22,31 +38,70 @@ def strip_png(data):
     return data
 
 
-def get_master_url(embed_url, timeout_s=60):
-    master = None
+def open_embed(embed_url, timeout_s=60):
+    """Open the embed page once and collect everything: master playlist URL,
+    episode title, intro timestamps and the subtitle track URL."""
+    out = {}
     with sync_playwright() as p:
         b = p.chromium.launch(headless=True)
         pg = b.new_context(user_agent=UA).new_page()
+
         def on_resp(r):
-            nonlocal master
-            if "getSources" in r.url and master is None:
+            if "getSources" in r.url and "master" not in out:
                 try:
-                    f = r.json()["sources"][0]["file"]
+                    j = r.json()
+                    f = j["sources"][0]["file"]
                     if f.startswith("/p?t="):
-                        master = BASE + f
+                        out["master"] = BASE + f
+                        out["intro"] = j.get("intro") or {"start": 0, "end": 0}
+                        tr = j.get("tracks") or []
+                        vf = tr[0].get("file", "") if tr else ""
+                        out["vtt"] = BASE + vf if vf.startswith("/p?t=") else None
                 except Exception:
                     pass
+
         pg.on("response", on_resp)
         pg.goto(embed_url, wait_until="domcontentloaded", timeout=90000)
         for _ in range(timeout_s):
-            if master:
+            if "master" in out:
                 break
             pg.wait_for_timeout(1000)
+        try:
+            out["title"] = pg.title()
+        except Exception:
+            out["title"] = ""
         b.close()
-    return master
+    return out
 
 
-def download_episode(master_url, referer, outfile, test=False):
+def clean_title(raw):
+    """'Ep 556: Unveiled! ... - ReCloud' -> 'Unveiled! ...'"""
+    t = re.sub(r"^\s*Ep\.?\s*\d+\s*:\s*", "", raw or "")
+    t = re.sub(r"\s*-\s*ReCloud\s*$", "", t)
+    return t.strip()
+
+
+def download_vtt(url, referer, path):
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Referer": referer})
+    r = s.get(url, timeout=60)
+    if r.status_code == 200 and b"WEBVTT" in r.content[:200]:
+        with open(path, "wb") as f:
+            f.write(r.content)
+        return True
+    return False
+
+
+def make_thumb(video_path, out_path, at=30):
+    """Grab a poster frame with ffmpeg."""
+    rc = subprocess.run(
+        ["ffmpeg", "-y", "-ss", str(at), "-i", video_path,
+         "-frames:v", "1", "-vf", "scale=480:-1", out_path],
+        capture_output=True)
+    return rc.returncode == 0 and os.path.exists(out_path)
+
+
+def download_episode(master_url, referer, outfile, test=False, on_progress=None):
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Referer": referer})
 
@@ -83,7 +138,9 @@ def download_episode(master_url, referer, outfile, test=False):
             done = 0
             for _ in ex.map(fetch, enumerate(segs)):
                 done += 1
-                if done % 25 == 0 or done == total:
+                if on_progress:
+                    on_progress(done, total)
+                elif done % 25 == 0 or done == total:
                     print(f"    {done}/{total}")
 
         with open(outfile + ".ts", "wb") as out:
@@ -133,7 +190,8 @@ def main():
         embed = f"{BASE}/embed/{a.server}/ani/{a.anime}/{ep}/{lang}"
         print(f"\n=== ep {ep} | {embed}")
         try:
-            master = get_master_url(embed)
+            meta = open_embed(embed)
+            master = meta.get("master")
         except Exception as e:
             print("  embed open error:", e)
             continue
