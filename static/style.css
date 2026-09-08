@@ -228,3 +228,55 @@ main { padding: 24px 26px 80px; max-width: 1400px; margin: 0 auto; }
 .ppopup input[type="range"] { width: 100%; accent-color: var(--red); cursor: pointer; }
 
 /* responsive player + header */
+
+/* fullscreen title overlay */
+.player-box:fullscreen .player-top {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 9;
+  padding: 16px 22px 30px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, .78), transparent);
+}
+.player-box:fullscreen .stage video {
+  transform: scale(var(--fszoom, 1)); transform-origin: center center;
+}
+
+/* ---------- tablet ---------- */
+@media (max-width: 900px) {
+  .grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+  main { padding: 18px 16px 60px; }
+}
+
+/* ---------- phones ---------- */
+@media (max-width: 640px) {
+  main { padding: 14px 12px 60px; }
+  .grid { grid-template-columns: 1fr; gap: 10px; }
+  header { padding: 12px 14px 10px; gap: 10px; }
+  .logo { font-size: 20px; }
+  #search { max-width: none; flex-basis: 100%; order: 10; }
+  .filters { width: 100%; order: 11; }
+  .filters button { flex: 1; padding: 9px 4px; font-size: 12px; }
+  .actions { width: 100%; order: 12; flex-wrap: wrap; justify-content: flex-start; }
+  #stats { width: 100%; font-size: 11.5px; }
+  .actions button { height: 32px; }
+  .tgl { padding: 7px 11px; font-size: 12px; }
+  #hero { padding: 18px 16px; margin-bottom: 16px; }
+  .card { padding: 13px; }
+  .row button { padding: 11px 0; font-size: 13px; }
+  #player-wrap { padding: 8px; }
+  .player-top { font-size: 13px; padding: 0 2px 8px; }
+  .pt-ep { font-size: 11px; padding: 3px 8px; }
+  #player-title { font-size: 13px; }
+  .player-ctl button { height: 32px; padding: 0 10px; font-size: 12px; }
+  .stage video { max-height: 60vh; }
+  .player-box:fullscreen .stage video { max-height: 100%; }
+  .ctlbar { padding: 18px 8px 8px; }
+  .ctime { font-size: 10.5px; margin: 0 3px; }
+  .cbtn { height: 30px; min-width: 30px; font-size: 13px; padding: 0 5px; }
+  .cbtn.chip { padding: 0 7px; font-size: 10.5px; }
+  .volwrap input[type="range"] { width: 44px; }
+  .settings, .ppopup { width: calc(100% - 24px); right: 12px; bottom: 46px; }
+  #btn-skipintro, #btn-skipoutro {
+    right: 12px; bottom: 74px; padding: 9px 16px; font-size: 12.5px;
+  }
+  .po-play { width: 64px; height: 64px; font-size: 26px; }
+  .po-title { font-size: 15px; }
+}
