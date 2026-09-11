@@ -22,12 +22,36 @@ import argparse, os, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
-from playwright.sync_api import sync_playwright
 
 BASE = "https://cdn.4animo.xyz"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 WORKERS = 6
+
+# Windows 8.1 can't run Playwright's bundled Chromium (needs Win10+).
+# When the user sets dl_browser_path in config.json (or this env var), we drive
+# that system Chrome/Edge instead, which runs fine on older Windows.
+CANDIDATE_BROWSERS = [
+    os.environ.get("ONE_PIECE_BROWSER", "") or "",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\EdgeCore\Application\msedge.exe",
+]
+
+
+def resolve_browser_path(forced=None):
+    """Return an executable path for launching, or None to use Playwright's
+    bundled Chromium. Prefers the (optional) forced path, then system browsers.
+    """
+    if forced:
+        return forced
+    for c in CANDIDATE_BROWSERS:
+        c = c.strip()
+        if c and os.path.exists(c):
+            return c
+    return None
 
 
 def strip_png(data):
@@ -38,39 +62,63 @@ def strip_png(data):
     return data
 
 
-def open_embed(embed_url, timeout_s=60):
-    """Open the embed page once and collect everything: master playlist URL,
-    episode title, intro timestamps and the subtitle track URL."""
+def cdn_reachable(timeout=8):
+    """Quick check that the source CDN is up before doing any work."""
+    try:
+        r = requests.get(f"{BASE}/", timeout=timeout)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
+def open_embed(embed_url, timeout_s=30, browser_path=None, precheck=False):
+    """Resolve the master HLS playlist with plain HTTP only — no browser needed,
+    so this runs on any Windows version (7/8/8.1/10/11).
+
+    1. GET the embed page html (the getSources token is right there in it)
+    2. GET /stream/getSources?t=<token>  ->  master playlist path + intro/outro
+       timestamps + subtitle track + episode title
+    """
     out = {}
-    with sync_playwright() as p:
-        b = p.chromium.launch(headless=True)
-        pg = b.new_context(user_agent=UA).new_page()
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": UA, "Referer": embed_url})
 
-        def on_resp(r):
-            if "getSources" in r.url and "master" not in out:
-                try:
-                    j = r.json()
-                    f = j["sources"][0]["file"]
-                    if f.startswith("/p?t="):
-                        out["master"] = BASE + f
-                        out["intro"] = j.get("intro") or {"start": 0, "end": 0}
-                        tr = j.get("tracks") or []
-                        vf = tr[0].get("file", "") if tr else ""
-                        out["vtt"] = BASE + vf if vf.startswith("/p?t=") else None
-                except Exception:
-                    pass
+    try:
+        r = sess.get(embed_url, timeout=timeout_s)
+    except Exception as e:
+        out["error"] = "embed unreachable: %s" % str(e)[:120]
+        return out
+    if r.status_code != 200:
+        out["error"] = "embed returned HTTP %s (source may be down)" % r.status_code
+        return out
 
-        pg.on("response", on_resp)
-        pg.goto(embed_url, wait_until="domcontentloaded", timeout=90000)
-        for _ in range(timeout_s):
-            if "master" in out:
-                break
-            pg.wait_for_timeout(1000)
-        try:
-            out["title"] = pg.title()
-        except Exception:
-            out["title"] = ""
-        b.close()
+    tok = re.search(r"getSources\?t=([A-Za-z0-9_\-.]+)", r.text)
+    if not tok:
+        out["error"] = "embed page has no stream token (source down or changed)"
+        return out
+
+    t = re.search(r"<title>(.*?)</title>", r.text, re.S)
+    if t:
+        out["title"] = t.group(1).strip()
+
+    try:
+        g = sess.get(f"{BASE}/stream/getSources?t={tok.group(1)}", timeout=timeout_s)
+        if g.status_code != 200:
+            out["error"] = "getSources returned HTTP %s" % g.status_code
+            return out
+        j = g.json()
+        f = j["sources"][0]["file"]
+        if not f.startswith("/p?t="):
+            out["error"] = "unexpected source format"
+            return out
+        out["master"] = BASE + f
+        out["intro"] = j.get("intro") or {"start": 0, "end": 0}
+        out["outro"] = j.get("outro") or {"start": 0, "end": 0}
+        tr = j.get("tracks") or []
+        vf = tr[0].get("file", "") if tr else ""
+        out["vtt"] = BASE + vf if vf.startswith("/p?t=") else None
+    except Exception as e:
+        out["error"] = "getSources parse failed: %s" % str(e)[:120]
     return out
 
 
@@ -105,17 +153,26 @@ def download_episode(master_url, referer, outfile, test=False, on_progress=None)
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Referer": referer})
 
-    uris = [l for l in s.get(master_url, timeout=30).text.splitlines()
-            if l and not l.startswith("#")]
+    mr = s.get(master_url, timeout=30)
+    if mr.status_code != 200 or "#EXTM3U" not in mr.text:
+        print("  master playlist fetch failed (HTTP %s)" % mr.status_code)
+        return False
+    uris = [l.strip() for l in mr.text.splitlines()
+            if l.strip() and not l.startswith("#")]
     if not uris:
         print("  empty master playlist")
         return False
-    variant = uris[0]
-    lines = s.get(variant, timeout=30).text.splitlines()
+    vr = s.get(uris[0], timeout=30)
+    if vr.status_code != 200 or "#EXTM3U" not in vr.text:
+        print("  variant playlist fetch failed (HTTP %s)" % vr.status_code)
+        return False
+    lines = vr.text.splitlines()
     segs, i = [], 0
     while i < len(lines):
         if lines[i].startswith("#EXTINF") and i + 1 < len(lines):
-            segs.append(lines[i + 1])
+            u = lines[i + 1].strip()
+            if u.startswith("http"):
+                segs.append(u)
             i += 2
         else:
             i += 1
@@ -169,6 +226,8 @@ def main():
     ap.add_argument("--sub", action="store_true", help="download SUB instead of DUB")
     ap.add_argument("--out", default="downloads", help="output folder")
     ap.add_argument("--test", action="store_true", help="fetch only 10 segments to verify")
+    ap.add_argument("--browser", default=None,
+                    help="path to chrome/edge exe (use this on Windows 8.1)")
     a = ap.parse_args()
 
     if a.ep_range:
@@ -183,20 +242,17 @@ def main():
         sys.exit(2)
 
     lang = "sub" if a.sub else "dub"
+    bpath = resolve_browser_path(a.browser)
     os.makedirs(a.out, exist_ok=True)
     ok = 0
 
     for ep in eps:
         embed = f"{BASE}/embed/{a.server}/ani/{a.anime}/{ep}/{lang}"
         print(f"\n=== ep {ep} | {embed}")
-        try:
-            meta = open_embed(embed)
-            master = meta.get("master")
-        except Exception as e:
-            print("  embed open error:", e)
-            continue
+        meta = open_embed(embed, browser_path=bpath)
+        master = meta.get("master")
         if not master:
-            print("  no getSources/master found (episode may not exist on this server).")
+            print("  error:", meta.get("error", "no stream found"))
             continue
         print("  master ok")
         outfile = os.path.join(a.out, f"ep{ep:04d}.mp4")

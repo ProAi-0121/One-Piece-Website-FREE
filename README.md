@@ -11,9 +11,20 @@ Don't use it to redistribute anything, it's all served on your own lan.
 
 ## screenshots
 
+home page:
+
 ![home](screenshots/home.png)
+
+the player, paused (that big button is the custom pause overlay):
+
 ![player](screenshots/player.png)
+
+player settings menu (speed, toggles, fullscreen zoom):
+
 ![settings](screenshots/settings.png)
+
+phone layout:
+
 ![phone](screenshots/phone.png)
 
 ## how it works

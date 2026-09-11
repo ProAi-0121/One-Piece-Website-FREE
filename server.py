@@ -24,7 +24,7 @@ app = Flask(__name__, static_folder="static")
 
 _lock = threading.Lock()
 _jobs = {}                           # ep -> {"done":n,"total":t,"state":str,"error":None}
-WATCH_AFTER_SEC = 120                # >2 min watched -> marked as watched
+WATCH_AFTER_SEC = 300                # >5 min watched -> marked as watched
 KEEP_WATCHED = 2                     # keep only N most recent watched on disk
 _queue = queue.Queue()               # episodes waiting to be downloaded
 _worker_started = False
@@ -96,7 +96,7 @@ def _read_meta(ep):
 
 
 def _build_meta(ep):
-    """Fetch title/intro/subs for an already-downloaded episode (backfill)."""
+    """Fetch title/intro/outro/subs for an already-downloaded episode (backfill)."""
     embed = f"{dl.BASE}/embed/hd-2/ani/{ANIME_ID}/{ep}/dub"
     try:
         meta = dl.open_embed(embed)
@@ -105,6 +105,7 @@ def _build_meta(ep):
     m = {
         "title": dl.clean_title(meta.get("title", "")) or f"Episode {ep}",
         "intro": meta.get("intro") or {"start": 0, "end": 0},
+        "outro": meta.get("outro") or {"start": 0, "end": 0},
     }
     if meta.get("vtt"):
         if dl.download_vtt(meta["vtt"], embed, os.path.join(MEDIA, f"ep{ep:04d}.en.vtt")):
@@ -162,10 +163,11 @@ def _queue_worker():
         try:
             embed = f"{dl.BASE}/embed/hd-2/ani/{ANIME_ID}/{ep}/dub"
             job["state"] = "resolving"
-            meta = dl.open_embed(embed)
+            meta = dl.open_embed(embed, browser_path=_cfg().get("dl_browser_path"))
             master = meta.get("master")
             if not master:
-                job["state"], job["error"] = "error", "episode not found on source server"
+                job["state"], job["error"] = "error", meta.get(
+                    "error", "no stream found on source server")
                 continue
             job["state"] = "downloading"
             job["done"], job["total"] = 0, 0
@@ -178,10 +180,11 @@ def _queue_worker():
             if not ok:
                 job["error"] = "ffmpeg remux failed"
                 continue
-            # extras: title/intro/subs/thumbnail
+            # extras: title/intro/outro/subs
             try:
                 m = {"title": dl.clean_title(meta.get("title", "")) or f"Episode {ep}",
-                     "intro": meta.get("intro") or {"start": 0, "end": 0}}
+                     "intro": meta.get("intro") or {"start": 0, "end": 0},
+                     "outro": meta.get("outro") or {"start": 0, "end": 0}}
                 if meta.get("vtt"):
                     if dl.download_vtt(meta["vtt"], embed,
                                        os.path.join(MEDIA, f"ep{ep:04d}.en.vtt")):
@@ -258,6 +261,7 @@ def episodes():
             "time": t, "duration": d, "pct": pct, "watched": watched,
             "title": meta.get("title") or f"Episode {ep}",
             "intro": meta.get("intro") or {"start": 0, "end": 0},
+            "outro": meta.get("outro") or {"start": 0, "end": 0},
             "sub": bool(meta.get("sub")) and os.path.exists(
                 os.path.join(MEDIA, f"ep{ep:04d}.en.vtt")),
             "job": {k: job[k] for k in ("state", "done", "total", "error")} if job else None,

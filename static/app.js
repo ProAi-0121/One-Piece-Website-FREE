@@ -11,6 +11,7 @@ let autoSkipPref = localStorage.getItem("autoSkipIntro") === "1";
 let autoNextPref = localStorage.getItem("autoNext") !== "0";
 let autoSkipOutroPref = localStorage.getItem("autoSkipOutro") !== "0";
 let nextQueued = false;
+let lastTap = { t: 0, x: null, timer: null };
 
 const $ = (s) => document.querySelector(s);
 const grid = $("#grid");
@@ -35,6 +36,8 @@ async function load() {
   EPS = await (await fetch("/api/episodes")).json();
   render();
   continueHero();
+  const sy = parseInt(sessionStorage.getItem("scrollY") || "0", 10);
+  if (sy > 0) requestAnimationFrame(() => window.scrollTo(0, sy));
 }
 
 function match(ep) {
@@ -213,7 +216,7 @@ function nextEp() {
 
 function onTimeUpdate() {
   const t = V.currentTime, d = V.duration || 0;
-  if (d) {
+  if (d && !dragging) {
     $("#seekFill").style.width = (100 * t / d) + "%";
     $("#seekKnob").style.left = (100 * t / d) + "%";
     $("#cTime").textContent = fmt(t) + " / " + fmt(d);
@@ -263,25 +266,60 @@ $("#btn-next").onclick = nextEp;
 $("#cMute").onclick = () => { V.muted = !V.muted; $("#cMute").textContent = V.muted ? "🔇" : "🔊"; };
 $("#cVol").oninput = (e) => { V.volume = e.target.value / 100; V.muted = e.target.value == 0; };
 
-V.addEventListener("click", () => V.paused ? V.play() : V.pause());
-V.addEventListener("dblclick", toggleFs);
+V.addEventListener("click", (e) => {
+  // double-tap on left/right half skips ±10s (works on touch + mouse);
+  // a single tap toggles play/pause
+  const now = Date.now();
+  const half = e.clientX < innerWidth / 2 ? "L" : "R";
+  if (now - lastTap.t < 300 && lastTap.x === half) {
+    clearTimeout(lastTap.timer);
+    lastTap.t = 0;
+    V.currentTime = Math.min(V.duration || 1e9,
+      Math.max(0, V.currentTime + (half === "L" ? -10 : 10)));
+    return;
+  }
+  lastTap.t = now;
+  lastTap.x = half;
+  lastTap.timer = setTimeout(() => {
+    lastTap.t = 0;
+    V.paused ? V.play() : V.pause();
+  }, 300);
+});
 $("#pauseOverlay").addEventListener("click", () => V.play());
 
-/* seek: click + drag */
+/* seek: click + drag — visual scrub while dragging, commit on release */
 const seek = $("#seek");
 let dragging = false;
-function seekTo(clientX) {
+let dragTime = 0;
+function seekFraction(clientX) {
   const r = seek.getBoundingClientRect();
-  const f = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
-  if (V.duration) V.currentTime = f * V.duration;
+  return Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+}
+function paintSeek(f) {
+  $("#seekFill").style.width = (f * 100) + "%";
+  $("#seekKnob").style.left = (f * 100) + "%";
+  if (V.duration) $("#cTime").textContent = fmt(f * V.duration) + " / " + fmt(V.duration);
 }
 seek.addEventListener("pointerdown", (e) => {
   dragging = true;
-  seek.setPointerCapture(e.pointerId);
-  seekTo(e.clientX);
+  try { seek.setPointerCapture(e.pointerId); } catch (err) {}
+  const f = seekFraction(e.clientX);
+  dragTime = f * (V.duration || 0);
+  paintSeek(f);
 });
-seek.addEventListener("pointermove", (e) => { if (dragging) seekTo(e.clientX); });
-seek.addEventListener("pointerup", () => { dragging = false; });
+seek.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  const f = seekFraction(e.clientX);
+  dragTime = f * (V.duration || 0);
+  paintSeek(f);
+});
+function endDrag() {
+  if (!dragging) return;
+  dragging = false;
+  if (V.duration) V.currentTime = dragTime;
+}
+seek.addEventListener("pointerup", endDrag);
+seek.addEventListener("pointercancel", endDrag);
 
 /* fullscreen */
 function toggleFs() {
@@ -478,7 +516,13 @@ document.addEventListener("keydown", (e) => {
 });
 $("#player-wrap").addEventListener("click", (e) => { if (e.target.id === "player-wrap") closePlayer(); });
 
-/* ---------- filters + search ---------- */
+/* remember scroll position across reloads */
+window.addEventListener("scroll", () => {
+  clearTimeout(window._scrollSave);
+  window._scrollSave = setTimeout(() => {
+    sessionStorage.setItem("scrollY", String(window.scrollY));
+  }, 300);
+}, { passive: true });
 document.querySelectorAll(".filters button").forEach(b => {
   b.onclick = () => {
     document.querySelectorAll(".filters button").forEach(x => x.classList.remove("on"));
