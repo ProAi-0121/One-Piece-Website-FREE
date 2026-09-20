@@ -535,13 +535,21 @@ $("#search").addEventListener("input", (e) => { QUERY = e.target.value.trim(); r
 
 /* ---------- live download polling ---------- */
 let polling = null;
-function poll() {
+function pollTick() {
   clearInterval(polling);
   polling = setInterval(async () => {
-    const busy = EPS.some(x => x.job && x.job.state !== "done" && x.job.state !== "error");
-    await load();
+    try {
+      EPS = await (await fetch("/api/episodes")).json();
+      render();
+      continueHero();
+    } catch (e) {}
+    const busy = EPS.some(x => x.job && x.job.state && x.job.state !== "done" && x.job.state !== "error");
     if (!busy) clearInterval(polling);
   }, 2000);
+}
+function poll() {
+  load();            // refresh once right away — progress shows immediately
+  if (!polling) pollTick();  // keep ticking while any download is active
 }
 
 async function refreshStats() {
@@ -597,5 +605,10 @@ async function boot() {
   await load();
   refreshStats();
   setInterval(refreshStats, 10000);
+  /* if downloads are already running (e.g. page reloaded mid-download),
+     start live polling automatically */
+  if (EPS.some(x => x.job && x.job.state && x.job.state !== "done" && x.job.state !== "error")) {
+    pollTick();
+  }
 }
 boot();
