@@ -54,6 +54,37 @@ def resolve_browser_path(forced=None):
     return None
 
 
+CANDIDATE_FFMPEG = [
+    os.environ.get("ONE_PIECE_FFMPEG", "") or "",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe"),
+]
+
+
+def find_ffmpeg():
+    """Resolve an ffmpeg executable: env var, ffmpeg.exe next to the script,
+    or anything on PATH. Raises SystemExit with a clear message if none found,
+    instead of a cryptic FileNotFoundError [WinError 2]."""
+    forced = [c for c in CANDIDATE_FFMPEG if c]
+    for c in forced:
+        if os.path.exists(c):
+            return c
+    on_path = shutil.which("ffmpeg")
+    if on_path:
+        return "ffmpeg"
+    raise SystemExit("ffmpeg not found. Put ffmpeg.exe next to dl.py/server.py, "
+                     "add it to PATH, or set ONE_PIECE_FFMPEG to its full path.")
+
+
+def _run_ffmpeg(args):
+    """subprocess.run for ffmpeg that reports 'ffmpeg not found' clearly on
+    Windows instead of crashing with FileNotFoundError (WinError 2)."""
+    try:
+        return subprocess.run([find_ffmpeg()] + args, capture_output=True)
+    except FileNotFoundError:
+        print("ffmpeg not found — install it or set ONE_PIECE_FFMPEG.")
+        return None
+
+
 def strip_png(data):
     """The CDN wraps MPEG-TS in a PNG stub; the TS data follows the IEND chunk."""
     i = data.find(b"IEND")
@@ -142,10 +173,9 @@ def download_vtt(url, referer, path):
 
 def make_thumb(video_path, out_path, at=30):
     """Grab a poster frame with ffmpeg."""
-    rc = subprocess.run(
-        ["ffmpeg", "-y", "-ss", str(at), "-i", video_path,
-         "-frames:v", "1", "-vf", "scale=480:-1", out_path],
-        capture_output=True)
+    res = _run_ffmpeg(["-y", "-ss", str(at), "-i", video_path,
+                       "-frames:v", "1", "-vf", "scale=480:-1", out_path])
+    return res is not None and res.returncode == 0
     return rc.returncode == 0 and os.path.exists(out_path)
 
 
@@ -205,10 +235,9 @@ def download_episode(master_url, referer, outfile, test=False, on_progress=None)
                 with open(os.path.join(tmp, f"{n:05d}.ts"), "rb") as f:
                     shutil.copyfileobj(f, out)
 
-        rc = subprocess.run(["ffmpeg", "-y", "-i", outfile + ".ts", "-c", "copy",
-                             "-bsf:a", "aac_adtstoasc", outfile],
-                            capture_output=True).returncode
-        if rc == 0:
+        res = _run_ffmpeg(["-y", "-i", outfile + ".ts", "-c", "copy",
+                           "-bsf:a", "aac_adtstoasc", outfile])
+        if res and res.returncode == 0:
             os.remove(outfile + ".ts")
             return True
         print("  ffmpeg remux failed; raw .ts kept at", outfile + ".ts")
@@ -237,9 +266,7 @@ def main():
     else:
         print("Give --ep or --ep-range.")
         sys.exit(2)
-    if not shutil.which("ffmpeg"):
-        print("ffmpeg not found on PATH.")
-        sys.exit(2)
+    find_ffmpeg()  # clear error message if ffmpeg is missing
 
     lang = "sub" if a.sub else "dub"
     bpath = resolve_browser_path(a.browser)
