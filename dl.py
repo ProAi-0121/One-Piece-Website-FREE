@@ -18,7 +18,7 @@ Usage:
     python dl.py --ep 556 --test
     python dl.py --ep 556 --out "D:\\Anime\\OP"
 """
-import argparse, os, re, shutil, subprocess, sys, tempfile
+import argparse, os, re, shutil, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -26,7 +26,7 @@ import requests
 BASE = "https://cdn.4animo.xyz"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-WORKERS = 6
+WORKERS = 8
 
 # Windows 8.1 can't run Playwright's bundled Chromium (needs Win10+).
 # When the user sets dl_browser_path in config.json (or this env var), we drive
@@ -175,11 +175,11 @@ def make_thumb(video_path, out_path, at=30):
     """Grab a poster frame with ffmpeg."""
     res = _run_ffmpeg(["-y", "-ss", str(at), "-i", video_path,
                        "-frames:v", "1", "-vf", "scale=480:-1", out_path])
-    return res is not None and res.returncode == 0
-    return rc.returncode == 0 and os.path.exists(out_path)
+    return res is not None and res.returncode == 0 and os.path.exists(out_path)
 
 
-def download_episode(master_url, referer, outfile, test=False, on_progress=None):
+def download_episode(master_url, referer, outfile, test=False, on_progress=None,
+                     on_phase=None):
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Referer": referer})
 
@@ -215,11 +215,19 @@ def download_episode(master_url, referer, outfile, test=False, on_progress=None)
     try:
         def fetch(item):
             n, url = item
-            r = s.get(url, timeout=120)
-            if r.status_code != 200:
-                raise RuntimeError(f"seg {n}: HTTP {r.status_code}")
-            with open(os.path.join(tmp, f"{n:05d}.ts"), "wb") as f:
-                f.write(strip_png(r.content))
+            last = None
+            for attempt in range(3):          # transient CDN hiccups: retry
+                try:
+                    r = s.get(url, timeout=120)
+                    if r.status_code == 200:
+                        with open(os.path.join(tmp, f"{n:05d}.ts"), "wb") as f:
+                            f.write(strip_png(r.content))
+                        return
+                    last = RuntimeError(f"seg {n}: HTTP {r.status_code}")
+                except Exception as e:
+                    last = e
+                time.sleep(1 + attempt)
+            raise last
 
         with ThreadPoolExecutor(WORKERS) as ex:
             done = 0
@@ -230,11 +238,15 @@ def download_episode(master_url, referer, outfile, test=False, on_progress=None)
                 elif done % 25 == 0 or done == total:
                     print(f"    {done}/{total}")
 
+        if on_phase:
+            on_phase("joining")
         with open(outfile + ".ts", "wb") as out:
             for n in range(total):
                 with open(os.path.join(tmp, f"{n:05d}.ts"), "rb") as f:
                     shutil.copyfileobj(f, out)
 
+        if on_phase:
+            on_phase("remuxing")
         res = _run_ffmpeg(["-y", "-i", outfile + ".ts", "-c", "copy",
                            "-bsf:a", "aac_adtstoasc", outfile])
         if res and res.returncode == 0:

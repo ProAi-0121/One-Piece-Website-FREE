@@ -28,6 +28,28 @@ WATCH_AFTER_SEC = 300                # >5 min watched -> marked as watched
 KEEP_WATCHED = 2                     # keep only N most recent watched on disk
 _queue = queue.Queue()               # episodes waiting to be downloaded
 _worker_started = False
+_meta_cache = {}                     # ep -> (mtime, sidecar json)
+_size_cache = {"scan": 0.0, "sizes": {}}   # refreshed at most every 2s
+
+
+def _media_sizes():
+    """One os.scandir pass for all episode sizes, cached for 2 seconds.
+    Replaces ~1150 os.path.getsize calls per /api/episodes poll."""
+    now = time.time()
+    if now - _size_cache["scan"] > 2:
+        sizes = {}
+        try:
+            for e in os.scandir(MEDIA):
+                if e.name.endswith(".mp4") and e.is_file():
+                    try:
+                        sizes[e.name] = e.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        _size_cache["sizes"] = sizes
+        _size_cache["scan"] = now
+    return _size_cache["sizes"]
 
 
 def _cfg():
@@ -87,12 +109,22 @@ def _sidecar(ep):
 
 
 def _read_meta(ep):
-    if os.path.exists(_sidecar(ep)):
-        try:
-            return json.load(open(_sidecar(ep), encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    """Read the sidecar JSON, cached by mtime so /api/episodes polling
+    doesn't re-read hundreds of small files every 2 seconds."""
+    p = _sidecar(ep)
+    try:
+        mt = os.path.getmtime(p)
+    except OSError:
+        return {}
+    c = _meta_cache.get(ep)
+    if c and c[0] == mt:
+        return c[1]
+    try:
+        m = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return {}
+    _meta_cache[ep] = (mt, m)
+    return m
 
 
 def _build_meta(ep):
@@ -175,7 +207,12 @@ def _queue_worker():
             def prog(done, total):
                 job["done"], job["total"] = done, total
 
-            ok = dl.download_episode(master, embed, ep_path(ep), on_progress=prog)
+            def phase(p):
+                if p in ("joining", "remuxing"):
+                    job["state"] = p
+
+            ok = dl.download_episode(master, embed, ep_path(ep),
+                                     on_progress=prog, on_phase=phase)
             job["state"] = "done" if ok else "error"
             if not ok:
                 job["error"] = "ffmpeg remux failed"
@@ -245,6 +282,7 @@ def episodes():
         with _lock:
             _save_progress(prog)
     last = int(cfg.get("last_episode", DEFAULT_LAST_EP))
+    sizes = _media_sizes()
     out = []
     for ep in range(1, last + 1):
         p = prog.get(str(ep), {})
@@ -252,12 +290,14 @@ def episodes():
         d = p.get("duration", 0)
         pct = round(100 * t / d, 1) if d else 0
         watched = _is_watched(p)
-        meta = _read_meta(ep) if ep_exists(ep) else {}
+        fname = f"ep{ep:04d}.mp4"
+        exists = fname in sizes
+        meta = _read_meta(ep) if exists else {}
         job = _jobs.get(ep)
         out.append({
             "ep": ep,
-            "exists": ep_exists(ep),
-            "size": os.path.getsize(ep_path(ep)) if ep_exists(ep) else 0,
+            "exists": exists,
+            "size": sizes.get(fname, 0),
             "time": t, "duration": d, "pct": pct, "watched": watched,
             "title": meta.get("title") or f"Episode {ep}",
             "intro": meta.get("intro") or {"start": 0, "end": 0},
@@ -401,11 +441,11 @@ def download_batch():
 
 @app.get("/api/stats")
 def stats():
-    files = [f for f in os.listdir(MEDIA) if f.endswith(".mp4")]
-    total = sum(os.path.getsize(os.path.join(MEDIA, f)) for f in files)
+    sizes = _media_sizes()
+    total = sum(sizes.values())
     prog = _load_progress()
     watched = sum(1 for v in prog.values() if _is_watched(v))
-    return jsonify({"downloaded": len(files),
+    return jsonify({"downloaded": len(sizes),
                     "bytes": total,
                     "watched": watched,
                     "active": sum(1 for j in _jobs.values()
