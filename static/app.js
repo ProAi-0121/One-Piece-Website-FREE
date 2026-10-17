@@ -12,6 +12,13 @@ let autoNextPref = localStorage.getItem("autoNext") !== "0";
 let autoSkipOutroPref = localStorage.getItem("autoSkipOutro") !== "0";
 let nextQueued = false;
 let lastTap = { t: 0, x: null, timer: null };
+let hls = null;              // hls.js instance while watching a live download
+let liveMode = false;        // playing an episode that is still downloading
+let pendingPlay = null;      // {ep, time} — open the player once playable
+let cards = new Map();       // ep -> {el, sig} for cheap per-card updates
+
+const ACTIVE_STATES = ["queued", "resolving", "downloading", "joining", "remuxing"];
+const SAVE_MS = 3000;
 
 const $ = (s) => document.querySelector(s);
 const grid = $("#grid");
@@ -21,6 +28,9 @@ function fmt(t) {
   const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
   return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s).padStart(2, "0");
 }
+
+function fmtMB(b) { return (b / 1e6).toFixed(0) + " MB"; }
+function fmtSpeed(v) { return v >= 5e5 ? (v / 1e6).toFixed(1) + " MB/s" : "…"; }
 
 let toastTimer = null;
 function toast(msg, ms) {
@@ -49,50 +59,115 @@ function match(ep) {
   return true;
 }
 
+function isActive(ep) {
+  return !!(ep.job && ACTIVE_STATES.includes(ep.job.state));
+}
+
+function playable(ep) {
+  return ep.exists || (isActive(ep) && window.Hls && Hls.isSupported());
+}
+
+/* signature of everything a card displays — only re-render a card when this
+   changes, instead of rebuilding 1150 cards every poll */
+function sigOf(ep) {
+  const j = ep.job;
+  return [ep.exists, ep.watched ? 1 : 0, ep.title, ep.pct || 0, ep.size,
+          j ? j.state : "", j ? j.done : 0, j ? j.total : 0,
+          j ? j.bytes : 0, j ? Math.round(j.speed / 1e5) : 0,
+          j ? (j.error || "") : ""].join("|");
+}
+
+function cardInner(ep) {
+  const j = ep.job;
+  const active = isActive(ep);
+  const pct = ep.pct || 0;
+  const mark = `<button class="btn-mark${ep.watched ? " on" : ""}" data-mark="${ep.ep}" title="Mark watched / unwatched">${ep.watched ? "✓" : "○"}</button>`;
+
+  let progline = "";
+  if (ep.exists && pct) progline = `<div class="bar"><div style="width:${pct}%"></div></div>`;
+  else if (active && j.state === "downloading" && j.total)
+    progline = `<div class="bar dl"><div style="width:${Math.round(100 * j.done / j.total)}%"></div></div>`;
+
+  let dlBtn;
+  if (ep.exists) {
+    dlBtn = `<button class="btn-dl done" disabled>✓ On disk</button>`;
+  } else if (active) {
+    let label;
+    if (j.state === "queued") label = "Queued…";
+    else if (j.state === "resolving") label = "Resolving…";
+    else if (j.state === "joining" || j.state === "remuxing") label = "Remuxing…";
+    else label = `${j.total ? Math.round(100 * j.done / j.total) : 0}% · ${fmtSpeed(j.speed)}`;
+    dlBtn = `<button class="btn-dl busy" disabled>${label}</button>` +
+            `<button class="btn-cancel" data-cancel="${ep.ep}" title="Cancel (keeps downloaded parts)">✕</button>`;
+  } else if (j && j.state === "error") {
+    dlBtn = `<button class="btn-dl" data-dl="${ep.ep}">↻ Retry</button>`;
+  } else {
+    dlBtn = `<button class="btn-dl" data-dl="${ep.ep}">⭳ Download</button>`;
+  }
+
+  let info;
+  if (ep.exists) info = pct ? `Resume at ${fmt(ep.time)} · ${fmtMB(ep.size)}` : fmtMB(ep.size);
+  else if (active) {
+    if (j.state === "queued") info = "Waiting in queue";
+    else if (j.state === "resolving") info = "Resolving stream…";
+    else if (j.state === "joining" || j.state === "remuxing") info = "Building mp4…";
+    else info = `${fmtMB(j.bytes)} · ${fmtSpeed(j.speed)}`;
+  }
+  else if (j && j.state === "error") info = j.error || "Download failed";
+  else info = "Not downloaded yet";
+
+  const badges = `${ep.exists ? `<span class="badge ok">READY</span>` : ""}` +
+    `${active && !ep.exists ? `<span class="badge live">⬇ DL</span>` : ""}` +
+    `<span class="badge hd">1080p</span><span class="badge dub">DUB</span>` +
+    `${ep.watched ? `<span class="badge watched-b">✓ WATCHED</span>` : ""}`;
+
+  return `
+    <div class="num">Episode <b>${ep.ep}</b>${mark}</div>
+    <div class="ep-title">${ep.title}</div>
+    <div class="badges">${badges}</div>
+    ${progline}
+    <div class="dl-info">${info}</div>
+    <div class="row">
+      <button class="btn-play" data-play="${ep.ep}" ${playable(ep) ? "" : "disabled"}>▶ ${active && !ep.exists ? "Watch now" : "Play"}</button>
+      ${dlBtn}
+    </div>`;
+}
+
 function render() {
   const list = EPS.filter(match);
   $("#empty").classList.toggle("hidden", list.length > 0);
   grid.innerHTML = "";
+  cards.clear();
   const frag = document.createDocumentFragment();
-
   for (const ep of list) {
     const card = document.createElement("div");
     card.className = "card" + (ep.watched ? " watched" : "");
     card.dataset.ep = ep.ep;
-
-    const pct = ep.pct || 0;
-    const mark = `<button class="btn-mark${ep.watched ? " on" : ""}" data-mark="${ep.ep}" title="Mark watched / unwatched">${ep.watched ? "✓" : "○"}</button>`;
-    const progline = ep.exists && pct
-      ? `<div class="bar"><div style="width:${pct}%"></div></div>` : "";
-
-    let dlBtn;
-    if (ep.exists) {
-      dlBtn = `<button class="btn-dl done" disabled>✓ On disk</button>`;
-    } else {
-      const j = ep.job;
-      if (j && j.state !== "done" && j.state !== "error") {
-        const p = j.total ? Math.round(100 * j.done / j.total) : 0;
-        dlBtn = `<button class="btn-dl busy" disabled>${p}% — ${j.state}</button>`;
-      } else if (j && j.state === "error") {
-        dlBtn = `<button class="btn-dl" data-dl="${ep.ep}">↻ Retry</button>`;
-      } else {
-        dlBtn = `<button class="btn-dl" data-dl="${ep.ep}">⭳ Download</button>`;
-      }
-    }
-
-    card.innerHTML = `
-      <div class="num">Episode <b>${ep.ep}</b>${mark}</div>
-      <div class="ep-title">${ep.title}</div>
-      <div class="badges">${ep.exists ? `<span class="badge ok">READY</span>` : ""}<span class="badge hd">1080p</span><span class="badge dub">DUB</span>${ep.watched ? `<span class="badge watched-b">✓ WATCHED</span>` : ""}</div>
-      ${progline}
-      <div class="dl-info">${ep.exists ? (pct ? `Resume at ${fmt(ep.time)} · ${(ep.size/1e6).toFixed(0)} MB` : `${(ep.size/1e6).toFixed(0)} MB`) : (ep.job && ep.job.error ? ep.job.error : "Not downloaded yet")}</div>
-      <div class="row">
-        <button class="btn-play" data-play="${ep.ep}" ${ep.exists ? "" : "disabled"}>▶ Play</button>
-        ${dlBtn}
-      </div>`;
+    card.innerHTML = cardInner(ep);
     frag.appendChild(card);
+    cards.set(ep.ep, { el: card, sig: sigOf(ep) });
   }
   grid.appendChild(frag);
+}
+
+/* poll-driven refresh: same card set → update only changed cards */
+function syncCards() {
+  const list = EPS.filter(match);
+  $("#empty").classList.toggle("hidden", list.length > 0);
+  let structural = list.length !== cards.size;
+  if (!structural) {
+    for (const ep of list) if (!cards.has(ep.ep)) { structural = true; break; }
+  }
+  if (structural) { render(); return; }
+  for (const ep of list) {
+    const c = cards.get(ep.ep);
+    const sig = sigOf(ep);
+    if (c.sig !== sig) {
+      c.sig = sig;
+      c.el.classList.toggle("watched", !!ep.watched);
+      c.el.innerHTML = cardInner(ep);
+    }
+  }
 }
 
 grid.addEventListener("click", async (e) => {
@@ -113,6 +188,12 @@ grid.addEventListener("click", async (e) => {
     await fetch(`/api/download/${d.dataset.dl}`, { method: "POST" });
     poll();
   }
+  const c = e.target.closest("[data-cancel]");
+  if (c) {
+    await fetch(`/api/cancel/${c.dataset.cancel}`, { method: "POST" });
+    toast("Cancelled — a retry resumes from where it stopped");
+    poll();
+  }
 });
 
 async function continueHero() {
@@ -131,25 +212,12 @@ async function continueHero() {
 
 function playOrFetch(ep, time) {
   const info = EPS.find(x => x.ep === ep);
-  if (info && info.exists) { openPlayer(ep, time); return; }
+  if (info && playable(info)) { openPlayer(ep, time); return; }
   fetch(`/api/download/${ep}`, { method: "POST" })
-    .then(() => { poll(); toast(`Downloading episode ${ep} — will start when ready`); })
+    .then(() => { poll(); toast(`Downloading episode ${ep} — playback starts as soon as it can`); })
     .catch(() => {});
-  waitAndPlay(ep, time);
-}
-
-function waitAndPlay(ep, time) {
-  const iv = setInterval(async () => {
-    try {
-      const d = await (await fetch("/api/episodes")).json();
-      const e = d.find(x => x.ep === ep);
-      if (e && e.exists) { clearInterval(iv); EPS = d; openPlayer(ep, time); }
-      else if (e && e.job && e.job.state === "error") {
-        clearInterval(iv);
-        toast(`Download failed for episode ${ep}`);
-      }
-    } catch (err) {}
-  }, 2000);
+  pendingPlay = { ep, time };
+  pollTick();
 }
 
 /* ================= PLAYER ================= */
@@ -161,45 +229,110 @@ function setPlayIcon() {
   $("#cPlay").textContent = V.paused ? "▶" : "⏸";
 }
 
-function openPlayer(ep, startAt) {
-  currentEp = ep;
-  const info = EPS.find(x => x.ep === ep) || {};
-  $("#player-ep").textContent = "EP " + ep;
-  $("#player-title").textContent = info.title || "";
-  $("#po-ep").textContent = "EP " + ep;
-  $("#po-title").textContent = info.title || "";
-  fetch(`/api/started/${ep}`, { method: "POST" }).catch(() => {});
-  loadSubtitleText(ep, info.sub);
+function stopHls() {
+  if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+  liveMode = false;
+  const chip = $("#liveChip");
+  if (chip) chip.classList.add("hidden");
+}
+
+function startMp4(ep, startAt) {
+  stopHls();
   V.src = `/video/${ep}`;
-  $("#player-wrap").classList.remove("hidden");
-  curIntro = (info.intro && info.intro.end > info.intro.start) ? info.intro : null;
-  curOutro = (info.outro && info.outro.end > info.outro.start) ? info.outro : null;
-  outroHandled = false;
-  nextQueued = false;
   V.onloadedmetadata = () => {
     if (startAt > 0 && startAt < V.duration - 5) V.currentTime = startAt;
     else if (autoSkipPref && curIntro && V.currentTime < curIntro.start) V.currentTime = curIntro.end;
     V.play().catch(() => {});
   };
   V.ontimeupdate = onTimeUpdate;
-  V.onplay = () => { setPlayIcon(); $("#pauseOverlay").classList.add("hidden"); };
-  V.onpause = () => {
-    setPlayIcon();
-    if (!V.ended) $("#pauseOverlay").classList.remove("hidden");
-  };
+  V.load();
+}
+
+/* live source: HLS playlist that grows as segments land on disk */
+function startLive(ep, startAt) {
+  stopHls();
+  liveMode = true;
+  const chip = $("#liveChip");
+  if (chip) chip.classList.remove("hidden");
+  V.removeAttribute("src");
+  hls = new Hls({
+    startPosition: startAt > 0 ? startAt : 0,
+    liveSyncDurationCount: 3,
+    fragLoadingMaxRetry: 6,
+    manifestLoadingMaxRetry: 8,
+    levelLoadingMaxRetry: 6,
+  });
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    if (startAt > 0) V.currentTime = startAt;
+    else if (autoSkipPref && curIntro) V.currentTime = curIntro.end;
+    V.play().catch(() => {});
+  });
+  hls.on(Hls.Events.ERROR, (_, data) => {
+    if (!data.fatal) return;
+    const info = EPS.find(x => x.ep === currentEp);
+    if (info && info.exists) { switchToMp4(); return; }
+    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      try { hls.startLoad(); } catch (e) {}
+    } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+      try { hls.recoverMediaError(); } catch (e) {}
+    } else {
+      stopHls();
+      toast("Live playback failed — try again in a moment");
+    }
+  });
+  hls.loadSource(`/hls/${ep}/index.m3u8`);
+  hls.attachMedia(V);
+  V.ontimeupdate = onTimeUpdate;
+}
+
+function switchToMp4() {
+  if (!liveMode || currentEp == null) return;
+  const t = V.currentTime || 0;
+  const wasPaused = V.paused;
+  startMp4(currentEp, t);
+  if (wasPaused) V.pause();
+  toast("Download finished — switched to the full mp4");
+}
+
+function openPlayer(ep, startAt) {
+  const info = EPS.find(x => x.ep === ep);
+  if (!info || !playable(info)) { playOrFetch(ep, startAt); return; }
+  currentEp = ep;
+  $("#player-ep").textContent = "EP " + ep;
+  $("#player-title").textContent = info.title || "";
+  $("#po-ep").textContent = "EP " + ep;
+  $("#po-title").textContent = info.title || "";
+  fetch(`/api/started/${ep}`, { method: "POST" }).catch(() => {});
+  loadSubtitleText(ep, info.sub || (info.job && info.job.sub));
+  $("#player-wrap").classList.remove("hidden");
+  curIntro = (info.intro && info.intro.end > info.intro.start) ? info.intro : null;
+  curOutro = (info.outro && info.outro.end > info.outro.start) ? info.outro : null;
+  outroHandled = false;
+  nextQueued = false;
+  if (!info.exists) startLive(ep, startAt);
+  else startMp4(ep, startAt);
   syncPrefsUI();
   V.play().catch(() => {});
 }
 
+function pushProgress(t, d) {
+  if (currentEp == null) return;
+  fetch("/api/progress", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ep: currentEp, time: t, duration: d }),
+  }).catch(() => {});
+}
+
+function flushProgress() {
+  clearTimeout(saveTimer);
+  pushProgress(V.currentTime, V.duration || 0);
+}
+
 function closePlayer() {
   V.pause();
-  if (currentEp != null && V.duration) {
-    fetch("/api/progress", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ep: currentEp, time: V.currentTime, duration: V.duration }),
-    });
-  }
+  flushProgress();
+  stopHls();
   V.removeAttribute("src"); V.load();
   $("#player-wrap").classList.add("hidden");
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -210,7 +343,7 @@ function closePlayer() {
 function nextEp() {
   if (currentEp == null) return;
   const nxt = EPS.find(x => x.ep === currentEp + 1);
-  if (nxt && nxt.exists) openPlayer(nxt.ep, 0);
+  if (nxt && playable(nxt)) openPlayer(nxt.ep, 0);
   else if (nxt) playOrFetch(nxt.ep, 0);
 }
 
@@ -230,7 +363,7 @@ function onTimeUpdate() {
   if (!nextQueued && t > 120) {
     nextQueued = true;
     const nx = EPS.find(x => x.ep === currentEp + 1);
-    if (nx && !nx.exists) {
+    if (nx && !nx.exists && !isActive(nx)) {
       fetch(`/api/download/${currentEp + 1}`, { method: "POST" }).then(poll).catch(() => {});
       toast(`Episode ${currentEp + 1} downloading for next`);
     }
@@ -247,16 +380,12 @@ function onTimeUpdate() {
       V.currentTime = Math.min(curOutro.end, d - 1);
     }
   }
-  if (autoNextPref && d && t >= d - 0.5 && !outroHandled) nextEp();
+  // in live mode `d` is just the downloaded-so-far edge — reaching it must
+  // never trigger auto-next, the episode isn't over yet
+  if (autoNextPref && !liveMode && d && t >= d - 0.5 && !outroHandled) nextEp();
   $("#pauseOverlay").classList.toggle("hidden", !V.paused);
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    fetch("/api/progress", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ep: currentEp, time: t, duration: d }),
-    });
-  }, 800);
+  saveTimer = setTimeout(() => pushProgress(t, d), SAVE_MS);
 }
 
 /* ---------- controls wiring ---------- */
@@ -265,6 +394,13 @@ $("#cNext").onclick = nextEp;
 $("#btn-next").onclick = nextEp;
 $("#cMute").onclick = () => { V.muted = !V.muted; $("#cMute").textContent = V.muted ? "🔇" : "🔊"; };
 $("#cVol").oninput = (e) => { V.volume = e.target.value / 100; V.muted = e.target.value == 0; };
+
+V.onplay = () => { setPlayIcon(); $("#pauseOverlay").classList.add("hidden"); };
+V.onpause = () => {
+  setPlayIcon();
+  if (!V.ended) $("#pauseOverlay").classList.remove("hidden");
+  flushProgress();
+};
 
 V.addEventListener("click", (e) => {
   // double-tap on left/right half skips ±10s (works on touch + mouse);
@@ -516,6 +652,15 @@ document.addEventListener("keydown", (e) => {
 });
 $("#player-wrap").addEventListener("click", (e) => { if (e.target.id === "player-wrap") closePlayer(); });
 
+/* save progress if the tab is closed / navigated away mid-episode */
+window.addEventListener("pagehide", () => {
+  if (currentEp != null && V.duration) {
+    navigator.sendBeacon("/api/progress", new Blob(
+      [JSON.stringify({ ep: currentEp, time: V.currentTime, duration: V.duration })],
+      { type: "application/json" }));
+  }
+});
+
 /* remember scroll position across reloads */
 window.addEventListener("scroll", () => {
   clearTimeout(window._scrollSave);
@@ -536,26 +681,43 @@ $("#search").addEventListener("input", (e) => { QUERY = e.target.value.trim(); r
 /* ---------- live download polling ---------- */
 let polling = null;
 function pollTick() {
-  clearInterval(polling);
+  if (polling) return;
   polling = setInterval(async () => {
+    let busy = false;
     try {
       EPS = await (await fetch("/api/episodes")).json();
-      render();
-      continueHero();
+      syncCards();
+      busy = EPS.some(x => isActive(x));
+
+      // waiting for an episode to become playable → open it (live if still downloading)
+      if (pendingPlay) {
+        const e = EPS.find(x => x.ep === pendingPlay.ep);
+        const want = pendingPlay.time;
+        if (e && playable(e)) { pendingPlay = null; openPlayer(e.ep, want); }
+        else if (e && e.job && (e.job.state === "error" || e.job.state === "cancelled")) {
+          pendingPlay = null;
+          toast(`Episode ${e.ep}: ${e.job.error || "download cancelled"}`);
+        }
+      }
+      // watched a live download through to the finished mp4 → hop over
+      if (liveMode && currentEp != null) {
+        const e = EPS.find(x => x.ep === currentEp);
+        if (e && e.exists && e.job && e.job.state === "done") switchToMp4();
+      }
     } catch (e) {}
-    const busy = EPS.some(x => x.job && x.job.state && x.job.state !== "done" && x.job.state !== "error");
-    if (!busy) clearInterval(polling);
+    if (!busy && !pendingPlay) { clearInterval(polling); polling = null; }
   }, 2000);
 }
 function poll() {
   load();            // refresh once right away — progress shows immediately
-  if (!polling) pollTick();  // keep ticking while any download is active
+  pollTick();        // keep ticking while any download is active
 }
 
 async function refreshStats() {
   const s = await (await fetch("/api/stats")).json();
   $("#stats").textContent =
-    `${s.downloaded} eps · ${(s.bytes / 1e9).toFixed(1)} GB · ${s.watched} watched`;
+    `${s.downloaded} eps · ${(s.bytes / 1e9).toFixed(1)} GB · ${s.watched} watched` +
+    (s.active ? ` · ⬇ ${s.active}` : "");
 }
 
 async function boot() {
@@ -585,6 +747,22 @@ async function boot() {
   });
   bindTgl("autoNextT", autoNextPref, (on) => setPref("autoNext", on));
   bindTgl("skipIntroT", autoSkipPref, (on) => setPref("autoSkipIntro", on));
+  /* queue the next 5 un-downloaded episodes */
+  $("#btn-batch").onclick = async () => {
+    try {
+      const r = await (await fetch("/api/download/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ count: 5 }),
+      })).json();
+      if (r.queued && r.queued.length) {
+        toast(`Queued episodes ${r.queued[0]}–${r.queued[r.queued.length - 1]}`);
+        poll();
+      } else {
+        toast("Nothing to queue — everything's already on disk or queued");
+      }
+    } catch (e) { toast("Batch download failed"); }
+  };
   /* saved playback speed */
   const sp = parseFloat(localStorage.getItem("speed") || "1");
   if (sp !== 1) {
@@ -607,7 +785,7 @@ async function boot() {
   setInterval(refreshStats, 10000);
   /* if downloads are already running (e.g. page reloaded mid-download),
      start live polling automatically */
-  if (EPS.some(x => x.job && x.job.state && x.job.state !== "done" && x.job.state !== "error")) {
+  if (EPS.some(x => isActive(x))) {
     pollTick();
   }
 }
